@@ -1,0 +1,8 @@
+# Never — this repo is PUBLIC
+*.key
+*.pem
+*.env
+*.env.*
+!.env.example
+.doppler
+.DS_Store
