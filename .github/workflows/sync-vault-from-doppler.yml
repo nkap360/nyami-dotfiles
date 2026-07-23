@@ -1,0 +1,100 @@
+name: Sync vault from Doppler
+
+# Weekly encrypted backup of Doppler → nkap360/nyami-secrets-vault (private).
+#
+# Lives in this PUBLIC repo because public-repo GitHub Actions minutes are
+# FREE and unlimited. The private vault repo gets pushed via VAULT_PAT.
+#
+# Security notes:
+#   • Never triggered by push or pull_request → PR from a fork cannot exfiltrate.
+#   • Secrets only exposed in this single job's runtime env, never echoed.
+#   • VAULT_PAT is scoped to `contents:write` on the vault repo only.
+#     (Currently a gh CLI OAuth token — rotate to a fine-grained PAT when
+#     you have 5 minutes; see nyami-secrets-vault/README.md.)
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # every Sunday 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: sync-vault-from-doppler
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the private vault repo
+        env:
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            "https://x-access-token:${VAULT_PAT}@github.com/nkap360/nyami-secrets-vault.git" \
+            vault
+          cd vault
+          git config user.name  "vault-bot"
+          git config user.email "vault-bot@nyami.fr"
+
+      - name: Install age + sops
+        run: |
+          set -euo pipefail
+          AGE_VERSION=1.3.1
+          SOPS_VERSION=3.13.2
+          curl -fsSL "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp
+          sudo mv /tmp/age/age /tmp/age/age-keygen /usr/local/bin/
+          curl -fsSL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" \
+            -o /tmp/sops
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+
+      - name: Install doppler CLI
+        uses: dopplerhq/cli-action@v3
+
+      - name: Restore age private key
+        env:
+          AGE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/sops/age
+          printf '%s\n' "$AGE_KEY" > ~/.config/sops/age/keys.txt
+          chmod 400 ~/.config/sops/age/keys.txt
+
+      - name: Sync — Doppler → encrypted vault files
+        env:
+          DOPPLER_TOKEN_SHARED:     ${{ secrets.DOPPLER_TOKEN_SHARED }}
+          DOPPLER_TOKEN_NYAMI:      ${{ secrets.DOPPLER_TOKEN_NYAMI }}
+          DOPPLER_TOKEN_ALPHAPILOT: ${{ secrets.DOPPLER_TOKEN_ALPHAPILOT }}
+          DOPPLER_TOKEN_BPSI:       ${{ secrets.DOPPLER_TOKEN_BPSI }}
+        working-directory: vault
+        run: |
+          set -euo pipefail
+          fetch() {
+            local project=$1 config=$2 token=$3 out=$4
+            echo "→ $project/$config → $out"
+            doppler secrets download \
+              --project "$project" --config "$config" \
+              --token "$token" \
+              --no-file --format env > "$out"
+            sops --encrypt --input-type env --output-type env --in-place "$out"
+          }
+          fetch shared                     core        "$DOPPLER_TOKEN_SHARED"     secrets/shared.enc.env
+          fetch nyami-agentic-portfolio    production  "$DOPPLER_TOKEN_NYAMI"      secrets/nyami-agentic-portfolio.enc.env
+          fetch alphapilot                 production  "$DOPPLER_TOKEN_ALPHAPILOT" secrets/alphapilot.enc.env
+          fetch bpsi                       production  "$DOPPLER_TOKEN_BPSI"       secrets/bpsi.enc.env
+
+      - name: Commit and push
+        working-directory: vault
+        run: |
+          set -euo pipefail
+          git add secrets/*.enc.env
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: sync vault from Doppler ($(date -u +%Y-%m-%d))"
+            git push origin HEAD
+          fi
